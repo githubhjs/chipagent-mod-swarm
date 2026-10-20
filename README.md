@@ -33,7 +33,7 @@ git clone https://github.com/githubhjs/chipagent-mod-swarm.git
 sudo install -m 0755 chipagent-mod-swarm/bin/chip-swarm /usr/local/bin/
 cd <your-repo>
 cp /path/to/chipagent-mod-swarm/chip-swarm.conf.example .chip-swarm.conf   # adjust --allow-edits
-bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 17 checks with a mock agent
+bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 19 checks with a mock agent
 ```
 
 Batch mode only runs shell commands listed in `.chipagents/automatic-commands.toml`
@@ -134,6 +134,21 @@ Worktrees, prompts, logs, reports and summaries go to
 An untracked `.chipagents/` directory (verify.sh, rules, skills, command
 allowlist) is copied into every worktree so the same settings apply there.
 
+## Workspace hooks inside team runs
+
+Every `chipagents batch` run loads the workspace's hooks (measured on
+ChipAgents 0.42.3), so gates from
+[chipagents-loop-kit](https://github.com/githubhjs/chipagents-loop-kit) and
+[claude-self-review-kit](https://github.com/githubhjs/claude-self-review-kit)
+apply inside each team:
+
+- **race and fanout teams** keep them: goal-gate, verify-gate and review-gate
+  push each team to finish and verify its own work before chip-swarm judges it.
+- **investigate and merge runs** are read-only, so chip-swarm starts them with
+  `CHIPAGENTS_HOOKS_INNER=1` (and `REVIEW_GATE_INNER=1`). Those gates skip such
+  runs instead of pushing an investigator that cannot edit anything.
+- The rerun budget is the workspace `post_turn_restarts`; reruns = value − 1.
+
 ## Cost and safety
 
 - N teams cost roughly N times the tokens of one run. `stats.json` records each
@@ -145,7 +160,7 @@ allowlist) is copied into every worktree so the same settings apply there.
 
 ## Test status
 
-`tests/selftest.sh` runs 17 checks against a mock `chipagents batch` that
+`tests/selftest.sh` runs 19 checks against a mock `chipagents batch` that
 follows the Batch Mode documentation: best-of-N selection, per-team options,
 `--first` stopping the slower teams, all teams failing, `--merge`, read-only
 investigators with a merged verdict, fan-out with a failing task, and `clean`.

@@ -58,6 +58,7 @@ check "race: exits 0 when a team passes" test $? -eq 0
 check "race: smallest passing diff wins (team 3)" summary_has '| 3 (winner)'
 check "race: failing team reported" summary_has '| 1 | .* | 0 | fail'
 check "race: per-team extra args reach team 2" grep -q 'extra=--thinking=high' "$MOCK_LOG"
+check "race: team runs keep the workspace gates (no inner flag)" bash -c "! grep -q 'inner=1' '$MOCK_LOG'"
 
 new_repo first
 start=$SECONDS
@@ -83,6 +84,7 @@ check "investigate: exits 0 with a verdict" test $? -eq 0
 check "investigate: merge run saw all 3 reports" summary_has 'from 3 reports'
 check "investigate: no run got --allow-edits" bash -c "! grep -q 'edits=[1-9]' '$MOCK_LOG'"
 check "investigate: 3 investigators + 1 merge run" test "$(wc -l < "$MOCK_LOG")" -eq 4
+check "investigate: every run marked inner (gates skip read-only runs)" test "$(grep -c 'inner=1' "$MOCK_LOG")" -eq 4
 
 new_repo fanout
 printf 'Task A: make answer.txt say ok\n---\nTask B: crash\n---\n\nTask C: make answer.txt say ok\n' > tasks.md

@@ -25,7 +25,7 @@ git clone https://github.com/githubhjs/chipagent-mod-swarm.git
 sudo install -m 0755 chipagent-mod-swarm/bin/chip-swarm /usr/local/bin/
 cd <你的 repo>
 cp /path/to/chipagent-mod-swarm/chip-swarm.conf.example .chip-swarm.conf   # 調整 --allow-edits
-bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 用模擬 agent 跑 17 項檢查
+bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 用模擬 agent 跑 19 項檢查
 ```
 
 batch mode 有兩個限制：
@@ -117,6 +117,14 @@ worktree、prompt、log、報告和總表都放在 `../.chip-swarm/<repo 名稱>
 
 如果 `.chipagents/`（verify.sh、rules、skills、指令允許清單）沒有被 git 追蹤，會自動複製到每個 worktree，讓設定在那裡同樣生效。
 
+## team run 裡的 workspace hook
+
+每一次 `chipagents batch` 都會載入 workspace 的 hook（已在 ChipAgents 0.42.3 實測），所以 [chipagents-loop-kit](https://github.com/githubhjs/chipagents-loop-kit) 和 [claude-self-review-kit](https://github.com/githubhjs/claude-self-review-kit) 的關卡在每個 team 裡都會生效：
+
+- **race 和 fanout 的 team** 保留這些關卡：goal-gate、verify-gate、review-gate 會讓每個 team 先完成並驗證自己的工作，chip-swarm 再來評判。
+- **investigate 和合併 run** 是唯讀的，所以 chip-swarm 啟動它們時會帶 `CHIPAGENTS_HOOKS_INNER=1`（以及 `REVIEW_GATE_INNER=1`）。這些關卡會跳過這種 run，不會去推一個本來就不能改檔案的調查員。
+- 重跑額度用的是 workspace 的 `post_turn_restarts`；重跑次數 = 這個值 − 1。
+
 ## 成本與安全
 
 - **成本**：N 個 team 大約花 N 倍 token。`stats.json` 記錄每個 team 的用量，總表也會顯示。
@@ -125,7 +133,7 @@ worktree、prompt、log、報告和總表都放在 `../.chip-swarm/<repo 名稱>
 
 ## 測試狀態
 
-`tests/selftest.sh` 用一個照 Batch Mode 文件寫的模擬 `chipagents batch`，跑 17 項檢查，涵蓋：
+`tests/selftest.sh` 用一個照 Batch Mode 文件寫的模擬 `chipagents batch`，跑 19 項檢查，涵蓋：
 - best-of-N 的選擇
 - 各 team 的不同參數
 - `--first` 停止較慢的 team

@@ -11,7 +11,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   *) echo "unknown option $1" >&2; exit 2;; esac; done
 prompt=$(cat "$pf")
 k=$(grep -oE '(team|task|investigator) [0-9]+ of' <<< "$prompt" | head -1 | grep -oE '[0-9]+')
-echo "$name edits=${#edits[@]} extra=${extra[*]:-} cwd=$(basename "$PWD")" >> "$MOCK_LOG"
+echo "$name edits=${#edits[@]} extra=${extra[*]:-} inner=${CHIPAGENTS_HOOKS_INNER:-} cwd=$(basename "$PWD")" >> "$MOCK_LOG"
 plan=$(tr ',' '\n' <<< "${MOCK_PLAN:-}" | grep "^${k:-0}:" | head -1)
 outcome=$(cut -d: -f2 <<< "$plan"); delay=$(cut -d: -f3 <<< "$plan")
 sleep "${delay:-0}"

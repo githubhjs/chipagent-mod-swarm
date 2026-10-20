@@ -359,6 +359,11 @@ cmd_investigate() {
   task=$(cat "$task_file")
   setup_run investigate
   read_only_argv
+  # Batch runs load the workspace hooks. Investigators and the merge run are
+  # read-only, so gates that push an agent to keep working (goal-gate,
+  # verify-gate, nonstop, ralph-loop, review-gate from chipagents-loop-kit and
+  # claude-self-review-kit) must skip them; those hooks honour this flag.
+  export CHIPAGENTS_HOOKS_INNER=1 REVIEW_GATE_INNER=1
 
   local n=${#hypotheses[@]} k dir
   for ((k = 1; k <= n; k++)); do
