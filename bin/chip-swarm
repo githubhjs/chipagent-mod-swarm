@@ -1,0 +1,497 @@
+#!/bin/bash
+
+# chip-swarm: run several headless ChipAgents teams in parallel.
+#
+#   chip-swarm race        [-n N] [-j J] [--first] [--strategies FILE] [--merge] TASK_FILE
+#       N teams solve the same task, each in its own git worktree and with
+#       its own strategy. The project's verify script judges them. Default:
+#       wait for all and pick the best passing team (smallest diff, then
+#       fewest tokens). --first: the first team that passes wins and the
+#       others are stopped. --merge: merge the winner into the current branch.
+#
+#   chip-swarm investigate [-j J] [--worktrees] HYPOTHESES_FILE TASK_FILE
+#       One read-only investigator per hypothesis (one per line). Each
+#       gathers evidence for and against its hypothesis and writes a report;
+#       a final merge run reconciles all reports into one verdict.
+#       --worktrees: give each investigator its own worktree (for checks
+#       that write build or simulation output).
+#
+#   chip-swarm fanout      [-j J] TASKS_FILE
+#       Independent tasks (separated by lines containing only ---) run in
+#       parallel, each in its own worktree and branch; every result is
+#       verified and committed, nothing is merged.
+#
+#   chip-swarm clean       [RUN_ID]      remove a run's worktrees and branches
+#                                        (all runs when RUN_ID is omitted)
+#
+# Settings come from the environment or ./.chip-swarm.conf (bash syntax):
+#   AGENT_ARGV        agent command (bash array). Placeholders replaced per
+#                     team: {prompt_file} {output_file} {stats_file} {name}
+#   TEAM_EXTRA_ARGS   per-team extra arguments (array of strings, team 1..N)
+#   TEAM_TIMEOUT      seconds per team run (default 3600)
+#   SWARM_DIR         where worktrees, logs and reports go
+#                     (default: ../.chip-swarm/<repo name>)
+# Needs bash 4.4, git, coreutils (timeout). No jq.
+
+set -uo pipefail
+
+if [[ -f .chip-swarm.conf ]]; then
+  # shellcheck disable=SC1091
+  source ./.chip-swarm.conf
+fi
+
+TEAM_TIMEOUT="${TEAM_TIMEOUT:-3600}"
+DEFAULT_STRATEGIES=(
+  "Make the smallest change that satisfies the task, reusing what exists."
+  "Prefer the cleanest, most maintainable design, even if the change is larger."
+  "First write or extend a test that captures the requirement, then implement until it passes."
+)
+
+die() {
+  echo "chip-swarm: $*" >&2
+  exit 64
+}
+
+log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$RUN_DIR/swarm.log" >&2
+}
+
+usage() {
+  sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+  exit 64
+}
+
+first_existing() {
+  local file
+  for file in "$@"; do
+    if [[ -f "$file" ]]; then
+      echo "$file"
+      return
+    fi
+  done
+}
+
+# AGENT_ARGV without --allow-edits and its patterns: a read-only run.
+read_only_argv() {
+  local skipping=no arg
+  ro_argv=()
+  for arg in "${agent_argv[@]}"; do
+    if [[ "$arg" == --allow-edits ]]; then
+      skipping=yes
+      continue
+    fi
+    if [[ "$skipping" == yes && "$arg" != --* ]]; then
+      continue
+    fi
+    skipping=no
+    ro_argv+=("$arg")
+  done
+}
+
+# run_agent DIR NAME PROMPT_FILE OUTPUT_FILE STATS_FILE LOG_FILE EXTRA... -- ARGV...
+run_agent() {
+  local dir="$1" name="$2" prompt="$3" output="$4" stats="$5" logfile="$6"
+  shift 6
+  local extra=()
+  while [[ $# -gt 0 && "$1" != -- ]]; do
+    extra+=("$1")
+    shift
+  done
+  shift
+  local argv=() arg
+  for arg in "$@"; do
+    arg="${arg//"{name}"/$name}"
+    arg="${arg//"{prompt_file}"/$prompt}"
+    arg="${arg//"{output_file}"/$output}"
+    arg="${arg//"{stats_file}"/$stats}"
+    argv+=("$arg")
+  done
+  # Extra per-team options go right after the subcommand ("chipagents batch").
+  if [[ ${#extra[@]} -gt 0 && ${#argv[@]} -ge 2 ]]; then
+    argv=("${argv[0]}" "${argv[1]}" "${extra[@]}" "${argv[@]:2}")
+  fi
+  (cd "$dir" && timeout "$TEAM_TIMEOUT" "${argv[@]}" < /dev/null > "$logfile" 2>&1)
+}
+
+stats_tokens() {
+  grep -oE '"totalTokens"[[:space:]]*:[[:space:]]*[0-9]+' "$1" 2> /dev/null | head -n 1 | grep -oE '[0-9]+$' || echo 0
+}
+
+stats_failed() {
+  grep -qE '"status"[[:space:]]*:[[:space:]]*"failed"' "$1" 2> /dev/null
+}
+
+# Make a worktree on a new branch from HEAD; copy an untracked .chipagents/
+# so rules, skills, verify.sh and command allowlists apply there too.
+make_worktree() {
+  local wt="$1" branch="$2"
+  git worktree add -q -b "$branch" "$wt" HEAD || die "git worktree add failed for $wt"
+  if [[ -d .chipagents && -z "$(git ls-files .chipagents)" ]]; then
+    mkdir -p "$wt/.chipagents"
+    cp -R .chipagents/. "$wt/.chipagents/"
+    rm -f "$wt"/.chipagents/*.state "$wt"/.chipagents/*.count "$wt"/.chipagents/nonstop.*
+  fi
+}
+
+# Commit whatever the team changed (the copied .chipagents/ excluded).
+commit_worktree() {
+  local wt="$1" message="$2"
+  (
+    cd "$wt" || exit 1
+    git add -A -- . ':(exclude).chipagents' 2> /dev/null
+    if ! git diff --cached --quiet; then
+      git -c user.name="${GIT_AUTHOR_NAME:-chip-swarm}" -c user.email="${GIT_AUTHOR_EMAIL:-chip-swarm@localhost}" \
+        commit -q -m "$message"
+    fi
+  )
+}
+
+run_verify() {
+  local wt="$1" logfile="$2" verify
+  verify=$(cd "$wt" && first_existing .chipagents/verify.sh .claude/verify.sh)
+  if [[ -z "$verify" ]]; then
+    echo none
+    return
+  fi
+  if (cd "$wt" && timeout "$TEAM_TIMEOUT" bash "$verify") > "$logfile" 2>&1; then
+    echo pass
+  else
+    echo fail
+  fi
+}
+
+# One race/fanout team: run the agent, commit, verify, write result.
+run_team() {
+  local k="$1" prompt="$2" label="$3"
+  local tdir="$RUN_DIR/team-$k" wt="$RUN_DIR/team-$k/wt" status verify tokens diff
+  local extra=()
+  if declare -p TEAM_EXTRA_ARGS > /dev/null 2>&1 && [[ -n "${TEAM_EXTRA_ARGS[$((k - 1))]:-}" ]]; then
+    read -ra extra <<< "${TEAM_EXTRA_ARGS[$((k - 1))]}"
+  fi
+  printf '%s\n' "$prompt" > "$tdir/prompt.md"
+  run_agent "$wt" "chip-swarm-$RUN_ID-$k" "$tdir/prompt.md" "$tdir/response.txt" "$tdir/stats.json" "$tdir/agent.log" \
+    "${extra[@]}" -- "${agent_argv[@]}"
+  status=$?
+  if [[ $status -eq 0 ]] && stats_failed "$tdir/stats.json"; then
+    status=1
+  fi
+  commit_worktree "$wt" "chip-swarm $RUN_ID $label"
+  verify=$(run_verify "$wt" "$tdir/verify.log")
+  tokens=$(stats_tokens "$tdir/stats.json")
+  diff=$(git -C "$wt" diff --numstat "$BASE" HEAD 2> /dev/null | awk '{n += $1 + $2} END {print n + 0}')
+  printf 'team=%s\nexit=%s\nverify=%s\ndiff=%s\ntokens=%s\nbranch=%s\n' \
+    "$k" "$status" "$verify" "$diff" "$tokens" "$(git -C "$wt" rev-parse --abbrev-ref HEAD)" > "$tdir/result"
+}
+
+result_field() {
+  sed -n "s/^$2=//p" "$1/result" 2> /dev/null
+}
+
+# Wait until fewer than $1 jobs run; return 0 when a job finished.
+throttle() {
+  while [[ $(jobs -rp | wc -l) -ge $1 ]]; do
+    wait -n 2> /dev/null || true
+  done
+}
+
+child_pids() {
+  if command -v pgrep > /dev/null 2>&1; then
+    pgrep -P "$1"
+  else
+    ps -ef 2> /dev/null | awk -v parent="$1" '$3 == parent { print $2 }'
+  fi
+}
+
+# Stop a team: collect its whole process tree first, then signal all of it,
+# so the team's wrapper cannot go on to commit or verify.
+kill_team() {
+  local queue=("$1") tree=() pid child
+  while [[ ${#queue[@]} -gt 0 ]]; do
+    pid="${queue[0]}"
+    queue=("${queue[@]:1}")
+    tree+=("$pid")
+    for child in $(child_pids "$pid"); do
+      queue+=("$child")
+    done
+  done
+  kill -TERM "${tree[@]}" 2> /dev/null
+}
+
+setup_run() {
+  local mode="$1"
+  agent_argv=()
+  if declare -p AGENT_ARGV 2> /dev/null | grep -q '^declare -a'; then
+    agent_argv=("${AGENT_ARGV[@]}")
+  fi
+  [[ ${#agent_argv[@]} -gt 0 ]] || die "set AGENT_ARGV in .chip-swarm.conf (see chip-swarm.conf.example)"
+  command -v "${agent_argv[0]}" > /dev/null || die "agent command not found: ${agent_argv[0]}"
+  git rev-parse --is-inside-work-tree > /dev/null 2>&1 || die "run inside a git repository"
+  TOPLEVEL=$(git rev-parse --show-toplevel)
+  cd "$TOPLEVEL" || die "cannot cd to $TOPLEVEL"
+  BASE=$(git rev-parse HEAD) || die "the repository needs at least one commit"
+  SWARM_DIR="${SWARM_DIR:-$(cd .. && pwd)/.chip-swarm/$(basename "$TOPLEVEL")}"
+  RUN_ID="$mode-$(date +%Y%m%d-%H%M%S)"
+  RUN_DIR="$SWARM_DIR/$RUN_ID"
+  mkdir -p "$RUN_DIR"
+  log "run $RUN_ID in $RUN_DIR (base $(git rev-parse --short HEAD))"
+}
+
+cmd_race() {
+  local n=3 j= first=no merge=no strategies_file= task_file
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n) n="$2"; shift 2 ;;
+      -j) j="$2"; shift 2 ;;
+      --first) first=yes; shift ;;
+      --merge) merge=yes; shift ;;
+      --strategies) strategies_file="$2"; shift 2 ;;
+      -*) usage ;;
+      *) task_file="$1"; shift ;;
+    esac
+  done
+  [[ -n "${task_file:-}" && -f "$task_file" ]] || die "race needs a TASK_FILE"
+  local task strategies=()
+  task=$(cat "$task_file")
+  if [[ -n "$strategies_file" ]]; then
+    mapfile -t strategies < <(grep -vE '^[[:space:]]*(#|$)' "$strategies_file")
+  else
+    strategies=("${DEFAULT_STRATEGIES[@]}")
+  fi
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "-n must be a positive number"
+  j="${j:-$n}"
+  setup_run race
+
+  local k pids=() strategy
+  for ((k = 1; k <= n; k++)); do
+    mkdir -p "$RUN_DIR/team-$k"
+    make_worktree "$RUN_DIR/team-$k/wt" "swarm/$RUN_ID/team-$k"
+  done
+  for ((k = 1; k <= n; k++)); do
+    strategy="${strategies[$(((k - 1) % ${#strategies[@]}))]}"
+    throttle "$j"
+    if [[ "$first" == yes ]] && grep -lx 'verify=pass' "$RUN_DIR"/team-*/result > /dev/null 2>&1; then
+      break
+    fi
+    log "team $k started: $strategy"
+    run_team "$k" "[chip-swarm race, team $k of $n] Several teams solve the same task independently, each in its own git worktree; the best verified solution wins. Work only inside your current directory.
+Your team's approach: $strategy
+When you are done, make sure the project's verify script (.chipagents/verify.sh) passes if there is one, and end your final response with a short summary of what you changed and why.
+----
+$task" "team $k: $strategy" &
+    pids[k]=$!
+  done
+
+  local winner=
+  if [[ "$first" == yes ]]; then
+    while [[ $(jobs -rp | wc -l) -gt 0 ]]; do
+      wait -n 2> /dev/null || true
+      winner=$(grep -lx 'verify=pass' "$RUN_DIR"/team-*/result 2> /dev/null | head -n 1)
+      if [[ -n "$winner" ]]; then
+        for k in "${!pids[@]}"; do
+          [[ -f "$RUN_DIR/team-$k/result" ]] || { kill_team "${pids[k]}"; log "team $k stopped: another team passed first"; }
+        done
+        break
+      fi
+    done
+    wait
+    winner=$(grep -lx 'verify=pass' "$RUN_DIR"/team-*/result 2> /dev/null | head -n 1)
+    winner="${winner:+$(dirname "$winner")}"
+  else
+    wait
+    # Best passing team: smallest diff, then fewest tokens.
+    winner=$(for k in $(seq 1 "$n"); do
+      local d="$RUN_DIR/team-$k"
+      [[ "$(result_field "$d" verify)" == pass ]] && printf '%s %s %s\n' "$(result_field "$d" diff)" "$(result_field "$d" tokens)" "$d"
+    done | sort -n -k1,1 -k2,2 | head -n 1 | cut -d' ' -f3)
+  fi
+
+  {
+    echo "# chip-swarm race $RUN_ID"
+    echo
+    echo "| Team | Strategy | Exit | Verify | Lines changed | Tokens | Branch |"
+    echo "|---|---|---|---|---|---|---|"
+    for ((k = 1; k <= n; k++)); do
+      local d="$RUN_DIR/team-$k"
+      strategy="${strategies[$(((k - 1) % ${#strategies[@]}))]}"
+      if [[ -f "$d/result" ]]; then
+        printf '| %s%s | %s | %s | %s | %s | %s | `%s` |\n' "$k" "$([[ "$d" == "$winner" ]] && echo ' (winner)')" "$strategy" \
+          "$(result_field "$d" exit)" "$(result_field "$d" verify)" "$(result_field "$d" diff)" "$(result_field "$d" tokens)" "$(result_field "$d" branch)"
+      else
+        printf '| %s | %s | stopped | — | — | — | `swarm/%s/team-%s` |\n' "$k" "$strategy" "$RUN_ID" "$k"
+      fi
+    done
+  } > "$RUN_DIR/SUMMARY.md"
+  cat "$RUN_DIR/SUMMARY.md"
+
+  if [[ -z "$winner" ]]; then
+    log "no team passed verification; worktrees kept in $RUN_DIR"
+    return 1
+  fi
+  local branch
+  branch=$(result_field "$winner" branch)
+  log "winner: $branch ($(basename "$winner"))"
+  if [[ "$merge" == yes ]]; then
+    if command -v git-flock > /dev/null; then
+      git flock merge --no-ff --no-edit "$branch" || return 1
+    else
+      git merge --no-ff --no-edit "$branch" || return 1
+    fi
+    log "merged $branch into $(git rev-parse --abbrev-ref HEAD)"
+  else
+    log "to take it: git merge $branch"
+  fi
+}
+
+cmd_investigate() {
+  local j=4 worktrees=no hyp_file= task_file=
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -j) j="$2"; shift 2 ;;
+      --worktrees) worktrees=yes; shift ;;
+      -*) usage ;;
+      *) if [[ -z "$hyp_file" ]]; then hyp_file="$1"; else task_file="$1"; fi; shift ;;
+    esac
+  done
+  [[ -f "$hyp_file" && -f "$task_file" ]] || die "investigate needs HYPOTHESES_FILE and TASK_FILE"
+  local hypotheses=() task
+  mapfile -t hypotheses < <(grep -vE '^[[:space:]]*(#|$)' "$hyp_file")
+  [[ ${#hypotheses[@]} -gt 0 ]] || die "no hypotheses in $hyp_file"
+  task=$(cat "$task_file")
+  setup_run investigate
+  read_only_argv
+
+  local n=${#hypotheses[@]} k dir
+  for ((k = 1; k <= n; k++)); do
+    mkdir -p "$RUN_DIR/team-$k"
+    if [[ "$worktrees" == yes ]]; then
+      make_worktree "$RUN_DIR/team-$k/wt" "swarm/$RUN_ID/team-$k"
+    fi
+  done
+  for ((k = 1; k <= n; k++)); do
+    dir="$TOPLEVEL"
+    [[ "$worktrees" == yes ]] && dir="$RUN_DIR/team-$k/wt"
+    throttle "$j"
+    log "investigator $k started: ${hypotheses[k - 1]}"
+    (
+      t="$RUN_DIR/team-$k"
+      printf '%s\n' "[chip-swarm investigate, investigator $k of $n] Several investigators examine the same question independently, each testing one hypothesis. Do not edit any files.
+Your hypothesis: ${hypotheses[k - 1]}
+Gather evidence both for and against it: read the code, logs and reports, and run read-only checks. End your final response with:
+VERDICT: SUPPORTED | REFUTED | INCONCLUSIVE
+CONFIDENCE: 0-100
+EVIDENCE: the key facts, each with a file:line, log line or command output
+WHAT WOULD SETTLE IT: the next check, if inconclusive
+----
+$task" > "$t/prompt.md"
+      run_agent "$dir" "chip-swarm-$RUN_ID-$k" "$t/prompt.md" "$t/report.md" "$t/stats.json" "$t/agent.log" -- "${ro_argv[@]}"
+      echo "exit=$?" > "$t/result"
+    ) &
+  done
+  wait
+
+  local merge_prompt="$RUN_DIR/merge-prompt.md"
+  {
+    echo "[chip-swarm merge] $n investigators examined the question below independently, each testing one hypothesis. Their reports follow. Do not edit any files."
+    echo "Reconcile them into one verdict: which hypotheses survive, where reports conflict and which evidence is stronger, the most likely explanation with a confidence, and the next concrete step. Do not trust a report's conclusion without its evidence; re-check key evidence yourself when it is cheap."
+    echo "----"
+    echo "$task"
+    for ((k = 1; k <= n; k++)); do
+      echo
+      echo "===== REPORT $k — hypothesis: ${hypotheses[k - 1]} ($(cat "$RUN_DIR/team-$k/result" 2> /dev/null))"
+      if [[ -s "$RUN_DIR/team-$k/report.md" ]]; then
+        cat "$RUN_DIR/team-$k/report.md"
+      else
+        tail -n 40 "$RUN_DIR/team-$k/agent.log" 2> /dev/null || echo "(no output)"
+      fi
+    done
+  } > "$merge_prompt"
+  log "merge run started"
+  run_agent "$TOPLEVEL" "chip-swarm-$RUN_ID-merge" "$merge_prompt" "$RUN_DIR/VERDICT.md" "$RUN_DIR/merge-stats.json" "$RUN_DIR/merge.log" -- "${ro_argv[@]}"
+  local status=$?
+  if [[ -s "$RUN_DIR/VERDICT.md" ]]; then
+    log "verdict written to $RUN_DIR/VERDICT.md"
+    cat "$RUN_DIR/VERDICT.md"
+    return 0
+  fi
+  log "merge run produced no verdict (exit $status); see $RUN_DIR/merge.log"
+  return 1
+}
+
+cmd_fanout() {
+  local j=4 tasks_file=
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -j) j="$2"; shift 2 ;;
+      -*) usage ;;
+      *) tasks_file="$1"; shift ;;
+    esac
+  done
+  [[ -f "$tasks_file" ]] || die "fanout needs a TASKS_FILE"
+  setup_run fanout
+  local n=0 k
+  # Split TASKS_FILE into blocks separated by lines containing only ---.
+  awk -v dir="$RUN_DIR" 'BEGIN { n = 1 } /^---[[:space:]]*$/ { n++; next } { print > (dir "/task-" n ".md") }' "$tasks_file"
+  for f in "$RUN_DIR"/task-*.md; do
+    [[ -n "$(tr -d '[:space:]' < "$f")" ]] && n=$((n + 1))
+  done
+  [[ $n -gt 0 ]] || die "no tasks in $tasks_file"
+  for ((k = 1; k <= n; k++)); do
+    mkdir -p "$RUN_DIR/team-$k"
+    make_worktree "$RUN_DIR/team-$k/wt" "swarm/$RUN_ID/task-$k"
+  done
+  for ((k = 1; k <= n; k++)); do
+    throttle "$j"
+    log "task $k started"
+    run_team "$k" "[chip-swarm fanout, task $k of $n] You work on one task of a batch, alone in your own git worktree. Work only inside your current directory. When done, make sure the project's verify script passes if there is one, and end with a short summary.
+----
+$(cat "$RUN_DIR/task-$k.md")" "task $k" &
+  done
+  wait
+  local failed=0
+  {
+    echo "# chip-swarm fanout $RUN_ID"
+    echo
+    echo "| Task | First line | Exit | Verify | Lines changed | Tokens | Branch |"
+    echo "|---|---|---|---|---|---|---|"
+    for ((k = 1; k <= n; k++)); do
+      local d="$RUN_DIR/team-$k"
+      printf '| %s | %s | %s | %s | %s | %s | `%s` |\n' "$k" "$(grep -m1 -v '^[[:space:]]*$' "$RUN_DIR/task-$k.md" | cut -c1-60)" \
+        "$(result_field "$d" exit)" "$(result_field "$d" verify)" "$(result_field "$d" diff)" "$(result_field "$d" tokens)" "$(result_field "$d" branch)"
+      [[ "$(result_field "$d" exit)" == 0 && "$(result_field "$d" verify)" != fail ]] || failed=$((failed + 1))
+    done
+  } > "$RUN_DIR/SUMMARY.md"
+  cat "$RUN_DIR/SUMMARY.md"
+  log "$((n - failed)) of $n tasks succeeded; branches swarm/$RUN_ID/task-*"
+  [[ $failed -eq 0 ]]
+}
+
+cmd_clean() {
+  git rev-parse --is-inside-work-tree > /dev/null 2>&1 || die "run inside a git repository"
+  local toplevel pattern wt
+  toplevel=$(git rev-parse --show-toplevel)
+  cd "$toplevel" || exit 1
+  pattern="swarm/${1:-}"
+  # Find chip-swarm worktrees by their branch, wherever SWARM_DIR put them.
+  git worktree list --porcelain | awk -v prefix="refs/heads/$pattern" '
+    /^worktree / { path = substr($0, 10) }
+    /^branch / && index(substr($0, 8), prefix) == 1 { print path }' | while read -r wt; do
+    git worktree remove --force "$wt" && echo "removed worktree $wt"
+  done
+  git worktree prune
+  # A pattern without wildcards matches refs below it, at any depth.
+  git for-each-ref --format='%(refname:short)' "refs/heads/$pattern" | while read -r b; do
+    git branch -q -D "$b" && echo "deleted branch $b"
+  done
+}
+
+mode="${1:-}"
+[[ -n "$mode" ]] || usage
+shift
+case "$mode" in
+  race) cmd_race "$@" ;;
+  investigate) cmd_investigate "$@" ;;
+  fanout) cmd_fanout "$@" ;;
+  clean) cmd_clean "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac

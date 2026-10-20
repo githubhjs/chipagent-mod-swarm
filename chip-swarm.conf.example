@@ -1,0 +1,28 @@
+# chip-swarm settings. Copy to the repository root as .chip-swarm.conf;
+# chip-swarm sources it with bash.
+#
+# Placeholders replaced for every team: {prompt_file} {output_file}
+# {stats_file} {name}. Keep --allow-edits last: it takes every following
+# word as a pattern. investigate mode drops --allow-edits automatically, so
+# investigators and the merge run cannot edit files.
+
+AGENT_ARGV=(
+  chipagents batch
+  --name "{name}"
+  --prompt-file "{prompt_file}"
+  --output "{output_file}"
+  --stats-file "{stats_file}"
+  # --skip-permissions                 # ONLY inside an isolated sandbox/container
+  --allow-edits "rtl/**" "tb/**" "sim/**" "docs/**"
+)
+
+# Optional extra options per team (team 1, team 2, ...), inserted right after
+# "chipagents batch". Useful to race different models or thinking levels.
+# TEAM_EXTRA_ARGS=(
+#   "--thinking high"
+#   "--thinking max"
+#   "--provider <alias from /provider>"
+# )
+
+TEAM_TIMEOUT=3600          # seconds per team run
+# SWARM_DIR=/path/to/scratch/.chip-swarm   # default: ../.chip-swarm/<repo name>
