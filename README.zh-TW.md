@@ -12,6 +12,27 @@
 
 整個工具就是一支 bash script，只需要 bash 4.4、git 和 coreutils，不需要 jq。它是為 CentOS 8 寫的，在 Git Bash 也能跑。
 
+## 該用哪一個
+
+先選對模式，這一步選錯最浪費時間。
+
+| 你要的 | 用哪個 | 怎麼做到 |
+|---|---|---|
+| 多種策略競賽，勝者出線 | `chip-swarm race` | 獨立行程，腳本裁決 |
+| 多個假設獨立查證再合流 | `chip-swarm investigate` | 唯讀調查者＋合流 |
+| 多個獨立任務並行 | `chip-swarm fanout` | 各自 worktree |
+| 團隊在同一 session 內 | [agent-teams](https://github.com/githubhjs/chipagent-mod-agent-teams) | 不開新行程，用 subagent |
+| 探索／設計／審查一個功能 | [feature-dev](https://github.com/githubhjs/chipagent-mod-feature-dev) | 平行探索再設計 |
+
+關鍵差別：[chip-swarm](https://github.com/githubhjs/chipagent-mod-swarm) 開的是**真的獨立行程**，每隊有自己的 context，結果由腳本判定；agent-teams 和 feature-dev 在當前 session 內跑，共用同一份 context。
+
+chip-swarm 是 CLI，不是 plugin：它沒有 marketplace.json 也沒有 plugin.json，把 `bin/chip-swarm` 放進 `PATH` 就好。agent-teams 和 feature-dev 是 Claude 格式的 plugin，用 `--type claude` 安裝。
+
+### 開跑前要兩個檔案
+
+- repo 根目錄的 `.chip-swarm.conf`（bash 語法）。`AGENT_ARGV` 開頭請用你 session 所用那支 ChipAgents 的**絕對路徑**（實測環境是 0.42.3），不要用 `PATH` 上第一支 `chipagents`：實測環境裡那支是 0.20.2，它裝 plugin 時也不會寫入 hook metadata。
+- `.chipagents/verify.sh` 負責判定成敗，可以是 untracked：chip-swarm 會把未追蹤的 `.chipagents/` 複製進每個 worktree。**絕對不要放在 `~/.chipagents/`**，那會卡住你每一個 session。
+
 ## 為什麼要另外做一個 runner
 
 - Claude Code 的 agent team plugin 依賴 Claude 專用的工具（`TeamCreate`、`SendMessage`、共用的 task list），ChipAgents 沒有這些。
@@ -134,9 +155,70 @@ worktree、prompt、log、報告和總表都放在 `../.chip-swarm/<repo 名稱>
 - **`--skip-permissions`**：照 ChipAgents 文件的說法，只能在隔離的 sandbox 或 container 裡用。
 - **team 之間看不到彼此的工作**：共用的介面和 contract 必須在 fan-out 之前就定好，不能在執行中協調。
 
+## 實跑紀錄：ChipAgents 0.42.3（2026-10-20）
+
+由 Josh_HUANG 在 CentOS 8 機器上以真的 `chipagents batch` 執行。底下每一個數字都來自真的跑過的指令。
+
+| 模式 | 結果 | 耗時 |
+|---|---|---|
+| `race -n 2 --merge` | rc=0，team-2 勝出並合併 | 1m47s |
+| `investigate -j 2` | rc=0，VERDICT 38 行 | 2m23s |
+| `fanout -j 2` | rc=0，2/2，產生 2 個 branch | 47.7s |
+
+```bash
+chip-swarm race        -n 2 --merge task.md
+chip-swarm investigate -j 2 hyp.txt bug.md
+chip-swarm fanout      -j 2 tasks.txt
+chip-swarm clean       [RUN_ID]
+```
+
+race 的實際 log：
+
+```
+11:01:35  team 1 started: Make the smallest change that satisfies...
+11:01:35  team 2 started: Prefer the cleanest, most maintainable...
+11:03:22  winner: swarm/race-20261020-110135/team-2
+11:03:23  merged ... into master
+```
+
+預設挑最佳的通過隊伍（diff 最小，再比 token）；`--first` 是第一個通過就停掉其他隊；`--merge` 直接合併勝者，不加就印出 `git merge` 指令讓你自己決定。
+
+### investigate 是最被低估的一個
+
+每個假設一個**唯讀**調查者（拿不到 `--allow-edits`，改不了任何東西），最後一個合流裁決。拿一個故意寫壞的 4 行 `fifo.v` 測：
+
+```
+H1: cnt has no reset, so it starts X
+H2: cnt wraps silently at 15
+```
+
+裁決做了最關鍵的一件事——**它自己重讀了 fifo.v，沒有照單全收報告**：
+
+```
+自行覆核：已讀 fifo.v 全文（4 行），與兩份報告引用完全一致。
+H1 無 reset，上電為 X          -> SUPPORTED
+H2 在 15 靜默 wrap             -> 現象為真，作為根因 REFUTED
+報告衝突：無實質衝突。最可能解釋 — 信心 95
+```
+
+注意 H2 的判法：行為確實存在，但**作為根因**被否決。單一 agent 很容易把這兩件事混為一談，這正是分頭查證再合流的價值。
+
+需要跑 build 或模擬的假設，加 `--worktrees` 給它自己的工作目錄。
+
+### 已知問題
+
+1. **執行位元會在傳輸中掉。** 經 VM 共用資料夾複製後，三個檔案沒有 x 位元，self-test 在開跑前就死掉：`chmod +x bin/chip-swarm tests/chipagents tests/selftest.sh`。在這個 repo 裡修權限（這裡已記錄為 100755）解決不了這條路徑。self-test 現在會自己複製 mock 並設定執行位元。
+2. **self-test 不穩定：已修正。** 在那台機器上 8 次執行中，「race --merge: winner merged」失敗 7 次、「race: exits 1 when no team passes」失敗 3 次；同一個 race --merge 情境放到乾淨的隔離 fixture 跑則 4 次全過，真實 race 也成功，所以問題指向 self-test 的 fixture。根因（之後找到，修正於 `ac64f10`）：run id 只有時間戳，self-test 各案例共用同一個 `SWARM_DIR`，同一秒內啟動的下一個 race 會沿用前一個的目錄，死在 `git worktree add`（exit 64）。「多個 `new_repo` 共用 `$work` 導致 `.chip-swarm` 互相干擾」這個假設在機器上被推翻，是因為 self-test 的 `SWARM_DIR` 是 `$work/swarm`，根本不叫 `.chip-swarm`。現在 run id 帶 process id、以原子 `mkdir` 取得，每個案例有自己的 `SWARM_DIR`，另有回歸測試同時啟動三個 race（舊版會失敗）。這個修正已在 Git Bash 重現並驗證，尚未在 CentOS 上重跑。
+3. self-test 用 `mktemp -d`，會落在 `/tmp`；不允許用 `/tmp` 的環境請設 `TMPDIR`。
+
+### 沒有驗證的事
+
+- ChipAgents 是否同時跑多個 subagent。已測事實：subagent 的回合**會**觸發 `post_turn` hook，但**不會**出現在 run log，只能靠副作用觀察；並行度本身沒測。這影響 agent-teams 與 feature-dev；chip-swarm 的每隊是獨立行程，不受影響。
+- agent-teams 與 feature-dev：見各自 README 的實跑紀錄。
+
 ## 測試狀態
 
-**在真正的 ChipAgents 0.42.3 上**（由 Josh_HUANG 實測）：兩個 team 用真的 `chipagents batch` 跑 race，1 分 47 秒完成；由 `.chipagents/verify.sh` 判定勝出者，chip-swarm 自動 merge（結束碼 0）。
+**在真正的 ChipAgents 0.42.3 上**：見上方[實跑紀錄](#實跑紀錄chipagents-0423-2026-10-20)。
 
 `tests/selftest.sh` 用一個照 Batch Mode 文件寫的模擬 `chipagents batch`，跑 22 項檢查，涵蓋：
 - best-of-N 的選擇
@@ -153,7 +235,7 @@ worktree、prompt、log、報告和總表都放在 `../.chip-swarm/<repo 名稱>
 
 最後一項檢查防的是一個已修正的 bug：
 - 以前 run id 只有時間戳，在快的機器上，同一秒內啟動的下一個 run 會沿用上一個的目錄，結果在 `git worktree add` 失敗。
-- 在 CentOS 上，這讓 `race --merge` 和「全部失敗」兩項檢查在 8 次 self-test 中失敗 7 次。
+- 在 CentOS 上，這讓 `race --merge` 在 8 次 self-test 中失敗 7 次、「全部失敗」失敗 3 次（見上方已知問題）。
 - 現在 run id 會帶上 process id，並用不可分割的 `mkdir` 佔用目錄。
 
 ## 相關 repo

@@ -16,6 +16,38 @@ agent-team and swarm plugins:
 It is a single bash script: bash 4.4, git and coreutils, no jq. It is written
 for CentOS 8 and also runs in Git Bash.
 
+## Which one to use
+
+Pick the mode first: picking the wrong one wastes the most time.
+
+| You want | Use | How |
+|---|---|---|
+| several strategies competing, the winner kept | `chip-swarm race` | separate processes, a script decides |
+| several hypotheses checked independently, then merged | `chip-swarm investigate` | read-only investigators plus one merge run |
+| several independent tasks in parallel | `chip-swarm fanout` | one worktree each |
+| a team inside the current session | [agent-teams](https://github.com/githubhjs/chipagent-mod-agent-teams) | subagents, no new processes |
+| explore, design and review one feature | [feature-dev](https://github.com/githubhjs/chipagent-mod-feature-dev) | parallel exploration, then design |
+
+The key difference: [chip-swarm](https://github.com/githubhjs/chipagent-mod-swarm)
+starts **real separate processes**, every team has its own context, and a
+script decides the result. agent-teams and feature-dev run inside the current
+session and share its context.
+
+chip-swarm is a CLI, not a plugin: it has no marketplace.json or plugin.json.
+Put `bin/chip-swarm` on `PATH`. agent-teams and feature-dev are Claude-format
+plugins, installed with `--type claude`.
+
+### Before the first run: two files
+
+- `.chip-swarm.conf` at the repository root (bash syntax). Start `AGENT_ARGV`
+  with the **absolute path** of the ChipAgents binary your sessions use
+  (0.42.3 where this was measured), not whichever `chipagents` comes first on
+  `PATH`: there it was 0.20.2, which also installs plugins without their hook
+  metadata.
+- `.chipagents/verify.sh` decides pass or fail. It may be untracked:
+  chip-swarm copies the untracked `.chipagents/` into every worktree. **Never
+  put it in `~/.chipagents/`**: there it would gate every session you run.
+
 ## Why a separate runner
 
 - Claude Code's agent-team plugins rely on Claude-only tools (`TeamCreate`,
@@ -165,11 +197,105 @@ apply inside each team:
 - Teams cannot see each other's work; contracts and shared interfaces have to be
   fixed before a fan-out, not negotiated during it.
 
+## Field report: ChipAgents 0.42.3 (2026-10-20)
+
+Measured by Josh_HUANG on a CentOS 8 machine with real `chipagents batch`
+runs. Every number below comes from a command that was actually run.
+
+| Mode | Result | Time |
+|---|---|---|
+| `race -n 2 --merge` | rc=0, team-2 won and was merged | 1m47s |
+| `investigate -j 2` | rc=0, a 38-line VERDICT | 2m23s |
+| `fanout -j 2` | rc=0, 2/2 tasks, two branches | 47.7s |
+
+```bash
+chip-swarm race        -n 2 --merge task.md
+chip-swarm investigate -j 2 hyp.txt bug.md
+chip-swarm fanout      -j 2 tasks.txt
+chip-swarm clean       [RUN_ID]
+```
+
+The race log:
+
+```
+11:01:35  team 1 started: Make the smallest change that satisfies...
+11:01:35  team 2 started: Prefer the cleanest, most maintainable...
+11:03:22  winner: swarm/race-20261020-110135/team-2
+11:03:23  merged ... into master
+```
+
+By default the best passing team wins (smallest diff, then fewest tokens).
+`--first` takes the first team that passes and stops the others. `--merge`
+merges the winner; without it chip-swarm prints the `git merge` command and
+leaves the decision to you.
+
+### investigate is the most underrated mode
+
+One **read-only** investigator per hypothesis (it never gets `--allow-edits`,
+so it cannot change anything), then one merge run. The test was a deliberately
+broken 4-line `fifo.v` with two hypotheses:
+
+```
+H1: cnt has no reset, so it starts X
+H2: cnt wraps silently at 15
+```
+
+The merge run did the most important thing: it **re-read fifo.v itself**
+instead of taking the reports at their word (translated from the original
+Chinese verdict):
+
+```
+Own check: read all of fifo.v (4 lines); both reports quote it exactly.
+H1  no reset, X at power-up    -> SUPPORTED
+H2  silent wrap at 15          -> the behaviour is real; as the root cause, REFUTED
+Conflicts between reports: none of substance. Most likely explanation, confidence 95.
+```
+
+Note how H2 was judged: the behaviour exists, but it was **refuted as the
+root cause**. A single agent easily conflates the two; telling them apart is
+what independent investigation followed by a merge is for.
+
+For hypotheses that need a build or a simulation, add `--worktrees` so each
+investigator gets its own working directory.
+
+### Known issues
+
+1. **Execute bits get lost in transit.** After a copy through a VM shared
+   folder, three files had no `x` bit and the self-test died before it
+   started: `chmod +x bin/chip-swarm tests/chipagents tests/selftest.sh`.
+   Fixing the modes in this repository (they are recorded as 100755) cannot
+   help that path. The self-test now copies the mock and sets its bit itself.
+2. **The self-test was flaky. Fixed.** In 8 runs on that machine, "race
+   --merge: winner merged" failed 7 times and "race: exits 1 when no team
+   passes" 3 times, while the same race --merge scenario in a clean, isolated
+   fixture passed 4 of 4 and real races succeeded, which pointed at the
+   self-test's fixture. Root cause, found afterwards and fixed in `ac64f10`:
+   run ids were a timestamp only, the self-test cases shared one `SWARM_DIR`,
+   and a race started in the same second as the previous one reused its
+   directory and died in `git worktree add` (exit 64). The hypothesis that
+   several `new_repo` cases sharing `$work` made their `.chip-swarm`
+   directories interfere was refuted on the machine because the self-test's
+   `SWARM_DIR` was `$work/swarm`, not `.chip-swarm`. Run ids now include the
+   process id and are claimed with an atomic `mkdir`, every case has its own
+   `SWARM_DIR`, and a regression check starts three races at the same moment
+   (the old code fails it). The fix was reproduced and verified in Git Bash;
+   it has not been re-run on CentOS yet.
+3. The self-test uses `mktemp -d`, which lands in `/tmp`. Where `/tmp` is not
+   allowed, set `TMPDIR`.
+
+### Not verified
+
+- Whether ChipAgents runs several subagents at the same time. Measured: a
+  subagent's turn **does** trigger `post_turn` hooks but does **not** appear
+  in the run log, so it can only be seen through side effects. Concurrency
+  itself was not measured. This matters for agent-teams and feature-dev, not
+  for chip-swarm, whose teams are separate processes.
+- agent-teams and feature-dev: see the field reports in their READMEs.
+
 ## Test status
 
-**On real ChipAgents 0.42.3** (measured by Josh_HUANG): a two-team race with
-real `chipagents batch` runs finished in 1m47s; `.chipagents/verify.sh` picked the
-winner and chip-swarm merged it (exit 0).
+**On real ChipAgents 0.42.3**: see the
+[field report](#field-report-chipagents-0423-2026-10-20) above.
 
 `tests/selftest.sh` runs 22 checks against a mock `chipagents batch` that
 follows the Batch Mode documentation: best-of-N selection, per-team options,
@@ -181,8 +307,9 @@ task, `clean`, and three races started at the same moment sharing one
 That last check guards a fixed bug: run ids used to be a timestamp only, so on
 a fast machine a run started in the same second as the previous one reused its
 directory and died in `git worktree add`. On CentOS this made `race --merge`
-and "no team passes" fail in 7 of 8 self-test runs. Run ids now carry the
-process id and are claimed with an atomic `mkdir`.
+fail in 7 of 8 self-test runs and "no team passes" in 3 of 8 (see Known
+issues above). Run ids now carry the process id and are claimed with an
+atomic `mkdir`.
 
 ## Related
 
