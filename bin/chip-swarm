@@ -230,9 +230,21 @@ setup_run() {
   cd "$TOPLEVEL" || die "cannot cd to $TOPLEVEL"
   BASE=$(git rev-parse HEAD) || die "the repository needs at least one commit"
   SWARM_DIR="${SWARM_DIR:-$(cd .. && pwd)/.chip-swarm/$(basename "$TOPLEVEL")}"
-  RUN_ID="$mode-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$SWARM_DIR" || die "cannot create $SWARM_DIR"
+  # Claim a unique run directory. A timestamp alone is not enough: two runs of
+  # the same mode started within one second (back-to-back on a fast machine,
+  # or in parallel) got the same id and the second died in `git worktree add`.
+  # The pid separates concurrent runs, and the atomic mkdir (no -p) settles
+  # any remaining clash.
+  local base n=0
+  base="$mode-$(date +%Y%m%d-%H%M%S)-$$"
+  RUN_ID="$base"
+  until mkdir "$SWARM_DIR/$RUN_ID" 2> /dev/null; do
+    n=$((n + 1))
+    [[ $n -lt 100 ]] || die "cannot create a run directory in $SWARM_DIR"
+    RUN_ID="$base-$n"
+  done
   RUN_DIR="$SWARM_DIR/$RUN_ID"
-  mkdir -p "$RUN_DIR"
   log "run $RUN_ID in $RUN_DIR (base $(git rev-parse --short HEAD))"
 }
 

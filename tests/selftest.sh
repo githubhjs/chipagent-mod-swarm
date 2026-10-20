@@ -6,15 +6,22 @@
 #   bash tests/selftest.sh
 #
 # Exit status is 0 when every check passes. Nothing outside a temporary
-# directory is touched; set KEEP=1 to keep it for inspection.
+# directory is touched; it is created under $TMPDIR (default /tmp), so set
+# TMPDIR to work elsewhere. Set KEEP=1 to keep it for inspection.
+#
+# Execute bits are not required: files copied through a VM shared folder lose
+# them, so chip-swarm is run with bash and the mock agent is copied into the
+# temporary directory and made executable there.
 
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 swarm="$(cd "$here/.." && pwd)/bin/chip-swarm"
 work="$(mktemp -d)"
-export PATH="$here:$PATH" MOCK_LOG="$work/mock.log"
-export SWARM_DIR="$work/swarm"
+mkdir -p "$work/bin"
+cp "$here/chipagents" "$work/bin/chipagents"
+chmod +x "$work/bin/chipagents"
+export PATH="$work/bin:$PATH" MOCK_LOG="$work/mock.log"
 passed=0
 failed=0
 
@@ -26,6 +33,8 @@ check() {
     passed=$((passed + 1))
   else
     echo "FAIL  $label"
+    # Show why: the end of chip-swarm's stderr for the case that just ran.
+    tail -n 5 "$work/err.txt" 2> /dev/null | sed 's/^/      | /'
     failed=$((failed + 1))
   fi
 }
@@ -33,6 +42,8 @@ check() {
 new_repo() {
   local dir="$work/$1"
   mkdir -p "$dir/.chipagents"
+  # Each case gets its own SWARM_DIR, so one case's runs cannot affect another.
+  export SWARM_DIR="$work/$1.swarm"
   cd "$dir" || exit 1
   git init -q
   git config user.name selftest
@@ -95,6 +106,27 @@ check "fanout: 3 task branches created" test "$(git branch --list 'swarm/*' | wc
 bash "$swarm" clean > /dev/null
 check "clean: branches removed" test "$(git branch --list 'swarm/*' | wc -l)" -eq 0
 check "clean: worktrees removed" test "$(git worktree list | wc -l)" -eq 1
+
+# Regression: runs that start in the same second must not collide. Run ids
+# used to be a timestamp only, so on a fast machine the second run reused the
+# first one's directory and died in `git worktree add`.
+shared="$work/shared.swarm"
+for name in twin-a twin-b twin-c; do
+  new_repo "$name"
+done
+for name in twin-a twin-b twin-c; do
+  (
+    cd "$work/$name" || exit 1
+    SWARM_DIR="$shared" MOCK_PLAN="1:pass:0" bash "$swarm" race -n 1 --merge task.md > out.txt 2> err.txt
+    echo $? > rc
+  ) &
+done
+wait
+cat "$work"/twin-*/err.txt > "$work/err.txt" 2> /dev/null
+check "concurrent runs sharing a SWARM_DIR: all exit 0" test "$(cat "$work"/twin-*/rc | tr -d '\n')" = 000
+check "concurrent runs: each got its own run directory" test "$(ls "$shared" | wc -l)" -eq 3
+check "concurrent runs: every repo has the merged result" \
+  bash -c "for d in '$work'/twin-*; do grep -qx ok \"\$d/answer.txt\" || exit 1; done"
 
 echo
 echo "$passed passed, $failed failed"

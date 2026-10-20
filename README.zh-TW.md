@@ -25,8 +25,11 @@ git clone https://github.com/githubhjs/chipagent-mod-swarm.git
 sudo install -m 0755 chipagent-mod-swarm/bin/chip-swarm /usr/local/bin/
 cd <你的 repo>
 cp /path/to/chipagent-mod-swarm/chip-swarm.conf.example .chip-swarm.conf   # 調整 --allow-edits
-bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 用模擬 agent 跑 19 項檢查
+bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 用模擬 agent 跑 22 項檢查
 ```
+
+- **不是用 git 取得檔案**（例如經過 VM 共用資料夾複製）時，執行權限會遺失。請用 `chmod +x bin/chip-swarm tests/chipagents tests/selftest.sh` 補回。self-test 本身不需要執行權限。
+- **self-test 的暫存位置**：工作目錄建在 `$TMPDIR` 底下（預設 `/tmp`），要放到別處請設定 `TMPDIR`。
 
 batch mode 有兩個限制：
 - 只能執行 `.chipagents/automatic-commands.toml` 列出的 shell 指令。範本見 [chipagents-loop-kit](https://github.com/githubhjs/chipagents-loop-kit/blob/main/outer-loop/automatic-commands.toml.example)。
@@ -133,17 +136,25 @@ worktree、prompt、log、報告和總表都放在 `../.chip-swarm/<repo 名稱>
 
 ## 測試狀態
 
-`tests/selftest.sh` 用一個照 Batch Mode 文件寫的模擬 `chipagents batch`，跑 19 項檢查，涵蓋：
+**在真正的 ChipAgents 0.42.3 上**（由 Josh_HUANG 實測）：兩個 team 用真的 `chipagents batch` 跑 race，1 分 47 秒完成；由 `.chipagents/verify.sh` 判定勝出者，chip-swarm 自動 merge（結束碼 0）。
+
+`tests/selftest.sh` 用一個照 Batch Mode 文件寫的模擬 `chipagents batch`，跑 22 項檢查，涵蓋：
 - best-of-N 的選擇
 - 各 team 的不同參數
 - `--first` 停止較慢的 team
 - 全部失敗
 - `--merge`
-- 唯讀調查員和合併結論
+- 唯讀調查員、合併結論和 inner 旗標
 - 有任務失敗的 fanout
 - `clean`
+- 三個 race 同時啟動、共用同一個 `SWARM_DIR`
 
-在 Windows 的 Git Bash 全部通過。**還沒有在真正的 ChipAgents 上跑過**；請先跑 self-test，再跑一次小規模的真實 race。
+在 Windows 的 Git Bash 全部通過。
+
+最後一項檢查防的是一個已修正的 bug：
+- 以前 run id 只有時間戳，在快的機器上，同一秒內啟動的下一個 run 會沿用上一個的目錄，結果在 `git worktree add` 失敗。
+- 在 CentOS 上，這讓 `race --merge` 和「全部失敗」兩項檢查在 8 次 self-test 中失敗 7 次。
+- 現在 run id 會帶上 process id，並用不可分割的 `mkdir` 佔用目錄。
 
 ## 相關 repo
 

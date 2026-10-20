@@ -33,8 +33,15 @@ git clone https://github.com/githubhjs/chipagent-mod-swarm.git
 sudo install -m 0755 chipagent-mod-swarm/bin/chip-swarm /usr/local/bin/
 cd <your-repo>
 cp /path/to/chipagent-mod-swarm/chip-swarm.conf.example .chip-swarm.conf   # adjust --allow-edits
-bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 19 checks with a mock agent
+bash /path/to/chipagent-mod-swarm/tests/selftest.sh                          # 22 checks with a mock agent
 ```
+
+- Copied the files without git (for example through a VM shared folder)? Execute
+  bits are lost that way; restore them with
+  `chmod +x bin/chip-swarm tests/chipagents tests/selftest.sh`. The self-test
+  itself does not need them.
+- The self-test works in a temporary directory under `$TMPDIR` (default `/tmp`);
+  set `TMPDIR` to put it elsewhere.
 
 Batch mode only runs shell commands listed in `.chipagents/automatic-commands.toml`
 (see the template in [chipagents-loop-kit](https://github.com/githubhjs/chipagents-loop-kit/blob/main/outer-loop/automatic-commands.toml.example)),
@@ -160,12 +167,22 @@ apply inside each team:
 
 ## Test status
 
-`tests/selftest.sh` runs 19 checks against a mock `chipagents batch` that
+**On real ChipAgents 0.42.3** (measured by Josh_HUANG): a two-team race with
+real `chipagents batch` runs finished in 1m47s; `.chipagents/verify.sh` picked the
+winner and chip-swarm merged it (exit 0).
+
+`tests/selftest.sh` runs 22 checks against a mock `chipagents batch` that
 follows the Batch Mode documentation: best-of-N selection, per-team options,
 `--first` stopping the slower teams, all teams failing, `--merge`, read-only
-investigators with a merged verdict, fan-out with a failing task, and `clean`.
-All pass in Git Bash on Windows. **It has not yet been run against a real
-ChipAgents installation**; run the self-test and a small real race first.
+investigators with a merged verdict and the inner flag, fan-out with a failing
+task, `clean`, and three races started at the same moment sharing one
+`SWARM_DIR`. All pass in Git Bash on Windows.
+
+That last check guards a fixed bug: run ids used to be a timestamp only, so on
+a fast machine a run started in the same second as the previous one reused its
+directory and died in `git worktree add`. On CentOS this made `race --merge`
+and "no team passes" fail in 7 of 8 self-test runs. Run ids now carry the
+process id and are claimed with an atomic `mkdir`.
 
 ## Related
 
